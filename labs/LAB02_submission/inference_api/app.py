@@ -212,11 +212,49 @@ async def predict(
 # Your code here!
 # 
 # /health should return: {"status": "healthy", "model_loaded": true}
+@app.get("/health")
+async def health():
+    return {
+        "status": "healthy",
+        "model_loaded": model is not None
+    }
 #
 # /stats should read from the log file and return statistics like:
 # - Total items processed
 # - Breakdown by classification
 # - Average confidence score
+@app.get("/stats")
+async def stats():
+    if not LOG_PATH.exists():
+        return {
+            "total_items": 0,
+            "classification_breakdown": {},
+            "average_confidence": 0.0
+        }
+    
+    total_items = 0
+    classification_breakdown = {}
+    total_confidence = 0.0
+
+    with open(LOG_PATH, 'r') as f:
+        for line in f:
+            total_items += 1
+            entry = json.loads(line)
+            pred = entry.get("top_prediction", "Unknown")
+            conf = entry.get("confidence", 0.0)
+            classification_breakdown[pred] = classification_breakdown.get(pred, 0) + 1
+            total_confidence += conf
+    
+    if total_items > 0:
+        average_confidence = total_confidence / total_items
+    else:
+        average_confidence = 0.0
+    
+    return {
+        "total_items": total_items,
+        "classification_breakdown": classification_breakdown,
+        "average_confidence": round(average_confidence, 2)
+    }
 
 
 if __name__ == "__main__":

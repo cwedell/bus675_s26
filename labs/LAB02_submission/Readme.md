@@ -1,8 +1,8 @@
 # Lab 2 Submission README
 
 ## Student Information
-- Name: [Your Name]
-- Date: [YYYY-MM-DD]
+- Name: Colton Wedell
+- Date: 2026-04-02
 
 ## Deliverables Included
 - `inference_api/Dockerfile`
@@ -15,28 +15,28 @@
 
 ### Inference API
 ```bash
-[PUT YOUR DOCKER BUILD COMMAND FOR INFERENCE API IMAGE HERE]
+docker build -t classifier-app .
 ```
 
 ### Preprocessor
 ```bash
-[PUT YOUR DOCKER BUILD COMMAND FOR PREPROCESSOR IMAGE HERE]
+docker build -t watcher-app .
 ```
 
 ## Docker Run Commands Used
 
 ### Inference API Container
 ```bash
-[PUT YOUR DOCKER RUN COMMAND FOR INFERENCE API CONTAINER HERE]
+docker run --name my-classifier-container -p 8000:8000 -v ${PWD}\..\logs:/logs classifier-app
 ```
 
 ### Preprocessor Container
 ```bash
-[PUT YOUR DOCKER RUN COMMAND FOR PREPROCESSOR CONTAINER HERE]
+docker run --name my-watcher-container -e API_URL="http://host.docker.internal:8000" -v ${PWD}\..\incoming:/incoming watcher-app
 ```
 
 ## Brief Explanation: How the Containers Communicate
-[Write 3-6 sentences here.]
+Each container can only access the endpoints that it needs to operate. The inference API container mounts to /logs to allow it to output results, and it uses the /predict endpoint to do its actual classification. The preprocessor container mounts to /incoming to allow it to view images, and it sends images to the API_URL that we defined when we first ran it. We give it the URL which points to the open port that we exposed when building the inference API image. Images and logs are preserved because we don't store anything inside the actual containers - we store everything on the host machine and simply allow the containers to access and modify those directories. Finally, we use host.docker.internal instead of localhost as the domain for our API URL, since localhost within a container simply refers to that container, and we need to back out to the host machine to access port 8000 where the inference API container is listening.
 
 Points to cover:
 - Which container calls which endpoint.
