@@ -182,20 +182,36 @@ class MoviePosterDataset(Dataset):
     def __init__(self, df, image_dir, vocab_builder, numeric_scaler,
                  transform=None):
         # YOUR CODE HERE
-        # Hint: call numeric_scaler.transform(df) once here and store the result
-        # so you're not recomputing it on every __getitem__ call.
-        raise NotImplementedError
-
+        self.df = df.reset_index(drop=True)
+        self.image_dir = Path(image_dir)
+        self.vocab_builder = vocab_builder
+        self.transform = transform
+        numeric_dict = numeric_scaler.transform(df)
+        self.numeric = np.stack([numeric_dict[col] for col in NUMERIC_COLS], axis=1)
+        self.label_map = {genre: idx for idx, genre in enumerate(GENRES)}
+        
     def __len__(self):
-        # YOUR CODE HERE
-        raise NotImplementedError
+        return len(self.df)
 
     def __getitem__(self, idx):
         # YOUR CODE HERE
-        # Return a dict or tuple containing image tensor, numeric tensor,
-        # categorical tensors, and the integer label.
-        raise NotImplementedError
-
+        row = self.df.iloc[idx]
+        try:
+            image = Image.open(self.image_dir / row["image_path"]).convert("RGB")
+        except Exception as e:
+            print(f"Error loading image for index {idx}: {e}")
+            image = Image.new("RGB", (IMAGE_SIZE, IMAGE_SIZE))
+        image = self.transform(image)
+        numeric = torch.tensor(self.numeric[idx])
+        cat_fields = {field: torch.tensor(self.vocab_builder.encode_list(row[field], field), dtype=torch.long)
+                       for field in LIST_FIELDS}
+        cat_fields["mpaa_rating"] = torch.tensor(self.vocab_builder.encode_single(row["mpaa_rating"], "mpaa_rating"), dtype=torch.long)
+        label = self.label_map[row["label"]]
+        return {"image": image,
+                "numeric": numeric,
+                "cat_fields": cat_fields,
+                "label": label}
+        
 
 # =============================================================================
 # YOUR CODE: Image Branch
@@ -210,13 +226,29 @@ class ImageBranch(nn.Module):
     def __init__(self, out_dim=256):
         super().__init__()
         # YOUR CODE HERE
+        self.net = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(),
+            nn.Dropout(p=0.25),
+            nn.Linear(128, out_dim)
+        )
         # Suggested structure: stack of Conv2d blocks that reduce spatial size,
         # followed by global average (or max) pooling, then a linear projection.
-        raise NotImplementedError
 
     def forward(self, x):
         # YOUR CODE HERE
-        raise NotImplementedError
+        return self.net(x)
 
 
 # =============================================================================
@@ -237,15 +269,44 @@ class TabularBranch(nn.Module):
     def __init__(self, vocab_sizes, out_dim=256):
         super().__init__()
         # YOUR CODE HERE
+        self.numeric_hidden = nn.Sequential(
+            nn.Linear(len(NUMERIC_COLS), 128),
+            nn.ReLU(),
+            nn.Dropout(p=0.25)
+        )
+        self.embeddings = nn.ModuleDict({
+            field: nn.Embedding(vocab_sizes[field], EMBED_DIM, padding_idx=0) for field in LIST_FIELDS + SINGLE_CAT_FIELDS
+        })
+        self.embed_hidden = nn.Sequential(
+            nn.Linear(len(LIST_FIELDS + SINGLE_CAT_FIELDS)*EMBED_DIM, 128),
+            nn.ReLU(),
+            nn.Dropout(p=0.25)
+        )
+        self.final = nn.Linear(128 + 128, out_dim)
         # vocab_sizes is a dict: {field_name: int} from vocab_builder.sizes
-        raise NotImplementedError
 
     def forward(self, numeric, cat_fields):
         # YOUR CODE HERE
+        numeric_features = self.numeric_hidden(numeric)
+        embed_features = []
+        for field, embedding in self.embeddings.items():
+            if field in cat_fields:
+                embedded = embedding(cat_fields[field])
+                if len(embedded.shape) == 3:  # list field
+                    mask = (cat_fields[field] != 0).float().unsqueeze(-1)
+                    n = mask.sum(dim=1).clamp(min=1)
+                    pooled = (embedded*mask).sum(dim=1) / n
+                else:  # single-cat field
+                    pooled = embedded
+                embed_features.append(pooled)
+            else:
+                embed_features.append(torch.zeros(numeric.size(0), EMBED_DIM, device=numeric.device))
+        embed_features = torch.stack(embed_features, dim=1).view(numeric.size(0), -1)
+        embed_features = self.embed_hidden(embed_features)
+        return self.final(torch.cat([numeric_features, embed_features], dim=1))
         # numeric:    (batch, len(NUMERIC_COLS)) float tensor
         # cat_fields: dict of {field_name: (batch, MAX_LIST_LEN) int tensor}
         #             plus mpaa_rating as a (batch,) int tensor
-        raise NotImplementedError
 
 
 # =============================================================================
@@ -261,11 +322,16 @@ class FusionHead(nn.Module):
     def __init__(self, image_dim, tabular_dim, num_classes=len(GENRES)):
         super().__init__()
         # YOUR CODE HERE
-        raise NotImplementedError
+        self.net = nn.Sequential(
+            nn.Linear(image_dim + tabular_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(p=0.25),
+            nn.Linear(128, num_classes)
+        )
 
     def forward(self, image_features, tabular_features):
         # YOUR CODE HERE
-        raise NotImplementedError
+        return self.net(torch.cat([image_features, tabular_features], dim=1))
 
 
 # =============================================================================
@@ -278,11 +344,15 @@ class MultimodalGenreClassifier(nn.Module):
     def __init__(self, vocab_sizes):
         super().__init__()
         # YOUR CODE HERE
-        raise NotImplementedError
+        self.image_branch = ImageBranch(out_dim=256)
+        self.tabular_branch = TabularBranch(vocab_sizes=vocab_sizes, out_dim=256)
+        self.fusion_head = FusionHead(image_dim=256, tabular_dim=256, num_classes=len(GENRES))
 
     def forward(self, image, numeric, cat_fields):
         # YOUR CODE HERE
-        raise NotImplementedError
+        image_features = self.image_branch(image)
+        tabular_features = self.tabular_branch(numeric, cat_fields)
+        return self.fusion_head(image_features, tabular_features)
 
 
 # =============================================================================
@@ -299,3 +369,113 @@ class MultimodalGenreClassifier(nn.Module):
 #
 # Device setup (works locally and on Colab GPU):
 #   device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+DATA_DIR = Path("../../data/movie_posters")
+CSV_PATHS = {
+    "train": DATA_DIR / "train_manifest.csv",
+    "val":   DATA_DIR / "val_manifest.csv",
+    "test":  DATA_DIR / "test_manifest.csv"
+}
+BATCH_SIZE = 32
+NUM_EPOCHS = 10
+LEARNING_RATE = 0.001
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+train_df = pd.read_csv(CSV_PATHS["train"])
+val_df = pd.read_csv(CSV_PATHS["val"])
+test_df = pd.read_csv(CSV_PATHS["test"])
+
+vocab_builder = VocabBuilder().fit(train_df)
+numeric_scaler = NumericScaler().fit(train_df)
+
+train_transform = transforms.Compose([
+    transforms.Resize(128),
+    transforms.RandomHorizontalFlip(),
+    transforms.ColorJitter(),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+eval_transform = transforms.Compose([
+    transforms.Resize(128),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+train_ds = MoviePosterDataset(train_df, DATA_DIR, vocab_builder, numeric_scaler, train_transform)
+val_ds = MoviePosterDataset(val_df, DATA_DIR, vocab_builder, numeric_scaler, eval_transform)
+test_ds = MoviePosterDataset(test_df, DATA_DIR, vocab_builder, numeric_scaler, eval_transform)
+
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
+val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE)
+test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE)
+
+model = MultimodalGenreClassifier(vocab_sizes=vocab_builder.sizes).to(device)
+criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=0.0001)
+
+best_val_acc = 0.0
+
+for epoch in range(NUM_EPOCHS):
+    model.train()
+    total_loss = 0
+    train_acc = 0
+    correct, total = 0, 0
+    for batch in train_loader:
+        images = batch["image"].to(device)
+        numeric = batch["numeric"].to(device)
+        cat_fields = {field: batch["cat_fields"][field].to(device) for field in LIST_FIELDS + SINGLE_CAT_FIELDS}
+        labels = batch["label"].to(device)
+        outputs = model(images, numeric, cat_fields)
+        loss = criterion(outputs, labels)
+        total_loss += loss.item()
+        _, predicted = torch.max(outputs, 1)
+        total += labels.size(0)
+        correct += (predicted == labels).sum().item()
+        train_acc = correct / total
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+    avg_loss = total_loss / len(train_loader)
+    model.eval()
+    val_acc = 0
+    correct, total = 0, 0
+    with torch.no_grad():
+        for batch in val_loader:
+            images = batch["image"].to(device)
+            numeric = batch["numeric"].to(device)
+            cat_fields = {field: batch["cat_fields"][field].to(device) for field in LIST_FIELDS + SINGLE_CAT_FIELDS}
+            labels = batch["label"].to(device)
+            outputs = model(images, numeric, cat_fields)
+            _, predicted = torch.max(outputs, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+            val_acc = correct / total
+        print(f"Epoch {epoch+1}/{NUM_EPOCHS}, Train Loss: {avg_loss:.4f}, Train Accuracy: {(100 * train_acc):.2f}%, Val Accuracy: {(100 * val_acc):.2f}%")
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            torch.save(model.state_dict(), "best_model.pth")
+            print("Saved new best checkpoint!")
+
+model.load_state_dict(torch.load("best_model.pth", map_location=device))
+model.eval()
+class_correct = [0] * len(GENRES)
+class_total = [0] * len(GENRES)
+with torch.no_grad():
+    for batch in test_loader:
+        images = batch["image"].to(device)
+        numeric = batch["numeric"].to(device)
+        cat_fields = {field: batch["cat_fields"][field].to(device) for field in LIST_FIELDS + SINGLE_CAT_FIELDS}
+        labels = batch["label"].to(device)
+        outputs = model(images, numeric, cat_fields)
+        _, predicted = torch.max(outputs, 1)
+        for i in range(labels.size(0)):
+            label = labels[i].item()
+            class_total[label] += 1
+            if predicted[i].item() == label:
+                class_correct[label] += 1
+
+for i in range(len(GENRES)):
+    if class_total[i] > 0:
+        print(f"Accuracy for {GENRES[i]}: {(100 * class_correct[i] / class_total[i]):.2f}%")
